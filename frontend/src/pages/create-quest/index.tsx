@@ -1,5 +1,5 @@
 import { Suspense, lazy } from "react"
-import { ArrowLeft, Wallet } from "lucide-react"
+import { ArrowLeft, Wallet, Clock, AlertTriangle, RefreshCw, Check } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useWallet } from "@/hooks/use-wallet"
 import { QuestCreationProvider, useQuestCreation } from "./context"
@@ -18,7 +18,15 @@ interface CreateQuestProps {
 }
 
 function CreateQuestContent({ onBack }: CreateQuestProps) {
-  const { currentStep } = useQuestCreation()
+  const {
+    currentStep,
+    lastSaved,
+    hasConflict,
+    hasDraftToRestore,
+    draftTimestamp,
+    restoreDraft,
+    dismissDraft,
+  } = useQuestCreation()
 
   return (
     <div className="relative mx-auto max-w-2xl px-4 py-8 sm:px-6">
@@ -35,12 +43,82 @@ function CreateQuestContent({ onBack }: CreateQuestProps) {
         Back to Dashboard
       </button>
 
-      {/* Page heading */}
-      <div className="animate-fade-in-up relative mb-6">
-        <h1 className="text-3xl font-semibold">Create a Quest</h1>
-        <p className="text-muted-foreground mt-1 text-sm">
-          Set up milestones and fund the reward pool to incentivize learners.
-        </p>
+      {/* Draft recovery banner */}
+      {hasDraftToRestore && (
+        <div className="mb-6 rounded-lg border border-primary/30 bg-primary/10 p-4 text-sm text-foreground shadow-sm">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <RefreshCw className="h-4 w-4 mt-0.5 text-primary shrink-0" />
+              <div>
+                <span className="font-semibold">Unsaved draft found.</span>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  You have an auto-saved draft from{" "}
+                  {draftTimestamp ? draftTimestamp.toLocaleTimeString() : "a previous session"}.
+                  Would you like to restore it?
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button size="sm" onClick={restoreDraft} className="h-7 px-2.5 text-xs">
+                Restore Draft
+              </Button>
+              <Button variant="ghost" size="sm" onClick={dismissDraft} className="h-7 px-2 text-xs">
+                Discard
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Conflict detection banner */}
+      {hasConflict && (
+        <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 p-4 text-sm text-foreground shadow-sm">
+          <div className="flex items-center gap-2.5">
+            <AlertTriangle className="h-4 w-4 text-warning shrink-0" />
+            <div className="flex-1">
+              <span className="font-semibold">Editing conflict detected!</span>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                This quest draft was recently modified in another browser tab. Saving here may overwrite those changes.
+              </p>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={restoreDraft}
+              className="h-7 px-2.5 text-xs border-warning/40 text-foreground"
+            >
+              Sync Latest
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Page heading with Auto-save indicator */}
+      <div className="animate-fade-in-up relative mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+        <div>
+          <h1 className="text-3xl font-semibold">Create a Quest</h1>
+          <p className="text-muted-foreground mt-1 text-sm">
+            Set up milestones and fund the reward pool to incentivize learners.
+          </p>
+        </div>
+
+        {/* Visual indicator showing last saved time */}
+        <div
+          data-testid="draft-status-indicator"
+          className="inline-flex items-center gap-1.5 self-start sm:self-auto rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-muted-foreground font-mono"
+        >
+          {lastSaved ? (
+            <>
+              <Check className="h-3 w-3 text-emerald-500" />
+              <span>Saved {lastSaved.toLocaleTimeString()}</span>
+            </>
+          ) : (
+            <>
+              <Clock className="h-3 w-3 text-muted-foreground" />
+              <span>Auto-save active</span>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Step indicator */}

@@ -23,6 +23,7 @@ pub enum DataKey {
     Quest(u32),
     Enrollees(u32),
     PublicQuests,
+    Categories,
     PublicCategoryQuests(String),
     OwnerQuests(Address),
     EnrolleeQuests(Address),
@@ -427,6 +428,7 @@ impl QuestContract {
                 DataKey::PublicCategoryQuests(quest.category.clone()),
                 id,
             );
+            Self::record_category(&env, &quest.category);
         }
         // Emit quest creation event
         // Event topics: (quest_created,)
@@ -495,6 +497,7 @@ impl QuestContract {
                     DataKey::PublicCategoryQuests(quest.category.clone()),
                     quest_id,
                 );
+                Self::record_category(&env, &quest.category);
             }
         }
 
@@ -1336,6 +1339,151 @@ impl QuestContract {
             ttl_remaining,
             expires_at,
         })
+    }
+
+    /// Record category in master index if not already present.
+    fn record_category(env: &Env, category: &String) {
+        let mut categories: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Categories)
+            .unwrap_or(Vec::new(env));
+        if !categories.contains(category) {
+            categories.push_back(category.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Categories, &categories);
+            common::extend_persistent_ttl(env, &DataKey::Categories);
+        }
+    }
+
+    /// List all registered categories with pagination support (Issue #1638).
+    pub fn list_categories(env: Env, page: u32, limit: u32) -> Vec<String> {
+        let categories: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Categories)
+            .unwrap_or(Vec::new(&env));
+
+        let total = categories.len();
+        let start = page.saturating_mul(limit);
+        if start >= total {
+            return Vec::new(&env);
+        }
+
+        let end = (start + limit).min(total);
+        let mut result = Vec::new(&env);
+        for i in start..end {
+            if let Some(cat) = categories.get(i) {
+                result.push_back(cat);
+            }
+        }
+        result
+    }
+
+    /// Get quest count for a specific category (Issue #1638).
+    pub fn category_quest_count(env: Env, category: String) -> u32 {
+        let key = DataKey::PublicCategoryQuests(category);
+        let ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+        ids.len()
+    }
+
+    /// Admin-only: merge source category into target category to consolidate duplicates (Issue #1638).
+    pub fn merge_categories(env: Env, source: String, target: String) -> Result<u32, Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+
+        if source == target {
+            return Ok(0);
+        }
+
+        let source_ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PublicCategoryQuests(source.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        let count = source_ids.len();
+
+        for i in 0..count {
+            if let Some(id) = source_ids.get(i) {
+                if let Ok(mut quest) = Self::load_quest(&env, id) {
+                    quest.category = target.clone();
+                    env.storage().persistent().set(&DataKey::Quest(id), &quest);
+                    Self::add_id_to_index(&env, DataKey::PublicCategoryQuests(target.clone()), id);
+                }
+            }
+        }
+
+        // Clean up source category index
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PublicCategoryQuests(source.clone()));
+
+        // Update master Categories list
+        let mut categories: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Categories)
+            .unwrap_or(Vec::new(&env));
+
+        if let Some(idx) = categories.first_index_of(&source) {
+            categories.remove(idx);
+        }
+        if !categories.contains(&target) {
+            categories.push_back(target.clone());
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Categories, &categories);
+        common::extend_persistent_ttl(&env, &DataKey::Categories);
+
+        Ok(count)
+    }
+
+    /// Clean up empty categories with zero active public quests (Issue #1638).
+    pub fn cleanup_empty_categories(env: Env) -> u32 {
+        let categories: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Categories)
+            .unwrap_or(Vec::new(&env));
+
+        let mut cleaned = 0;
+        let mut active = Vec::new(&env);
+
+        for i in 0..categories.len() {
+            if let Some(cat) = categories.get(i) {
+                let ids: Vec<u32> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::PublicCategoryQuests(cat.clone()))
+                    .unwrap_or(Vec::new(&env));
+                if ids.len() > 0 {
+                    active.push_back(cat);
+                } else {
+                    cleaned += 1;
+                }
+            }
+        }
+
+        if cleaned > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Categories, &active);
+            common::extend_persistent_ttl(&env, &DataKey::Categories);
+        }
+
+        cleaned
     }
 
     /// Get all quests owned by an address.
