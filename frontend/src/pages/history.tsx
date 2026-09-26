@@ -1,5 +1,5 @@
 import {
-  History,
+  History as HistoryIcon,
   ExternalLink,
   Loader2,
   AlertCircle,
@@ -7,13 +7,20 @@ import {
   Calendar,
   Coins,
   Trophy,
+  Download,
+  FileJson,
+  FileSpreadsheet,
 } from "lucide-react"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { useWallet } from "@/hooks/use-wallet"
 import { fetchWalletActivity, type WalletActivityItem } from "@/lib/horizon-activity"
+import {
+  downloadTransactionHistory,
+  type TransactionExportFormat,
+} from "@/lib/transaction-export"
 import { formatTokens } from "@/lib/utils"
 
 function formatHistoryDate(timestamp: number) {
@@ -30,7 +37,7 @@ function getActivityIcon(type: WalletActivityItem["type"]) {
     case "completed":
       return <Trophy className="h-5 w-5" />
     default:
-      return <History className="h-5 w-5" />
+      return <HistoryIcon className="h-5 w-5" />
   }
 }
 
@@ -81,6 +88,7 @@ export function History() {
   const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [capReached, setCapReached] = useState(false)
   const [filterType, setFilterType] = useState<WalletActivityItem["type"] | "all">("all")
+  const [exportStatus, setExportStatus] = useState<string | null>(null)
 
   useEffect(() => {
     if (!connected || !address) {
@@ -144,7 +152,28 @@ export function History() {
     }
   }
 
-  const filteredItems = historyItems.filter(item => filterType === "all" || item.type === filterType)
+  const filteredItems = historyItems.filter(
+    item => filterType === "all" || item.type === filterType
+  )
+
+  // Issue #1632 — let the learner keep their own on-chain record as CSV or JSON.
+  const handleExport = useCallback(
+    (format: TransactionExportFormat) => {
+      if (!address || filteredItems.length === 0) return
+      const label = format === "csv" ? "CSV" : "JSON"
+      try {
+        downloadTransactionHistory(filteredItems, format, {
+          wallet: address,
+          filter: filterType,
+          truncated: capReached,
+        })
+        setExportStatus(`Exported ${filteredItems.length} transactions as ${label}.`)
+      } catch {
+        setExportStatus(`Could not export history as ${label}. Please try again.`)
+      }
+    },
+    [address, capReached, filterType, filteredItems]
+  )
 
   if (!connected) {
     return (
@@ -153,7 +182,9 @@ export function History() {
         <div className="relative mx-auto max-w-lg px-4">
           <div className="bg-card text-card-foreground border-border animate-scale-in overflow-hidden border shadow-xl">
             <div className="bg-accent border-border flex items-center justify-between border-b px-6 py-3">
-              <span className="text-xs font-semibold tracking-wider uppercase">Transaction History</span>
+              <span className="text-xs font-semibold tracking-wider uppercase">
+                Transaction History
+              </span>
               <div className="flex items-center gap-1.5">
                 <div className="bg-destructive border-border h-2.5 w-2.5 border" />
                 <span className="text-xs font-bold">Not Connected</span>
@@ -161,13 +192,14 @@ export function History() {
             </div>
             <div className="p-8 text-center sm:p-10">
               <div className="bg-accent border-border animate-fade-in-up mx-auto mb-6 flex h-20 w-20 items-center justify-center border shadow-md">
-                <History className="h-8 w-8" />
+                <HistoryIcon className="h-8 w-8" />
               </div>
               <h1 className="animate-fade-in-up stagger-1 mb-3 text-2xl font-semibold sm:text-3xl">
                 View your history
               </h1>
               <p className="text-muted-foreground animate-fade-in-up stagger-2 mx-auto mb-8 max-w-sm">
-                Connect your Freighter wallet to see all your on-chain quest interactions, enrollments, and rewards.
+                Connect your Freighter wallet to see all your on-chain quest interactions,
+                enrollments, and rewards.
               </p>
               <Button
                 size="lg"
@@ -182,7 +214,7 @@ export function History() {
                   </>
                 ) : (
                   <>
-                    <History className="h-4 w-4" />
+                    <HistoryIcon className="h-4 w-4" />
                     Connect Wallet
                   </>
                 )}
@@ -212,7 +244,7 @@ export function History() {
             <div className="-mt-12 sm:-mt-16">
               <div className="flex items-start gap-4">
                 <div className="bg-accent border-border flex h-16 w-16 shrink-0 items-center justify-center border-2 shadow-md">
-                  <History className="h-8 w-8" />
+                  <HistoryIcon className="h-8 w-8" />
                 </div>
                 <div>
                   <h1 className="text-2xl font-semibold sm:text-3xl">Transaction History</h1>
@@ -226,11 +258,11 @@ export function History() {
         </div>
       </div>
 
-      {/* Filter */}
+      {/* Filter + export */}
       <div className="animate-fade-in-up relative mb-6">
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center gap-2">
-            <Filter className="h-4 w-4 text-muted-foreground" />
+            <Filter className="text-muted-foreground h-4 w-4" />
             <span className="text-sm font-semibold">Filter by:</span>
           </div>
           <div className="border-border flex gap-0 border shadow-md">
@@ -246,7 +278,35 @@ export function History() {
               </button>
             ))}
           </div>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleExport("csv")}
+              disabled={filteredItems.length === 0}
+              className="gap-2"
+            >
+              <FileSpreadsheet className="h-4 w-4" />
+              Export CSV
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleExport("json")}
+              disabled={filteredItems.length === 0}
+              className="gap-2"
+            >
+              <FileJson className="h-4 w-4" />
+              Export JSON
+            </Button>
+          </div>
         </div>
+        {exportStatus && (
+          <p className="text-muted-foreground mt-2 flex items-center gap-1.5 text-xs">
+            <Download className="h-3 w-3" />
+            {exportStatus}
+          </p>
+        )}
       </div>
 
       {/* Content */}
@@ -256,7 +316,9 @@ export function History() {
             <CardContent className="flex flex-col items-center py-12 text-center">
               <Loader2 className="text-accent mb-4 h-8 w-8 animate-spin" />
               <h3 className="mb-2 font-semibold">Loading transaction history</h3>
-              <p className="text-muted-foreground text-sm">Fetching your on-chain interactions from Horizon.</p>
+              <p className="text-muted-foreground text-sm">
+                Fetching your on-chain interactions from Horizon.
+              </p>
             </CardContent>
           </Card>
         ) : error ? (
@@ -272,7 +334,9 @@ export function History() {
             <CardContent className="flex flex-col items-center py-12 text-center">
               <Calendar className="text-muted-foreground mb-4 h-8 w-8" />
               <h3 className="mb-2 font-semibold">
-                {filterType === "all" ? "No transactions yet" : `No ${getActivityLabel(filterType).toLowerCase()} transactions`}
+                {filterType === "all"
+                  ? "No transactions yet"
+                  : `No ${getActivityLabel(filterType).toLowerCase()} transactions`}
               </h3>
               <p className="text-muted-foreground max-w-md text-sm">
                 Your on-chain quest interactions will appear here.
@@ -296,7 +360,9 @@ export function History() {
                           </Badge>
                           <Badge variant="secondary">{item.questName}</Badge>
                         </div>
-                        <p className="text-muted-foreground mt-2 text-sm">{getActivityDescription(item)}</p>
+                        <p className="text-muted-foreground mt-2 text-sm">
+                          {getActivityDescription(item)}
+                        </p>
                         <p className="text-muted-foreground mt-2 flex items-center gap-1.5 text-xs font-bold">
                           <Calendar className="h-3 w-3" />
                           {formatHistoryDate(item.timestamp)}

@@ -5,7 +5,6 @@ import {
   Target,
   Coins,
   ChevronRight,
-  Wallet,
   Sparkles,
   LayoutDashboard,
   Loader2,
@@ -30,7 +29,10 @@ import { milestoneClient } from "@/lib/contracts/milestone"
 import { rewardsClient } from "@/lib/contracts/rewards"
 import type { QuestInfo, CategoryInfo } from "@/lib/contract-types"
 import { useQuestStatsMap } from "@/hooks/use-quest-stats"
-import { formatTokens } from "@/lib/utils"
+import { prefetchQuestData } from "@/hooks/use-quest-data"
+import { queryClient } from "@/lib/query-client"
+import { useNowSeconds } from "@/hooks/use-now"
+import { formatTokens, getQuestLifecycleStatus } from "@/lib/utils"
 import { navigateToPath } from "@/lib/navigation"
 import { useOnboarding } from "@/hooks/use-onboarding"
 
@@ -46,7 +48,7 @@ const DASHBOARD_LOAD_MORE_SIZE = 20
 const TRENDING_QUEST_LIMIT = 2
 const RECENT_ACTIVITY_LIMIT = 5
 
-type QuestDiscoveryStatus = "all" | "active" | "upcoming" | "completed"
+type QuestDiscoveryStatus = "all" | "active" | "completed"
 
 interface DashboardProps {
   onSelectQuest?: (id: number) => void
@@ -55,14 +57,18 @@ interface DashboardProps {
   onLaunchTutorial?: () => void
 }
 
-export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: DashboardProps = {} as DashboardProps) {
-  const { connected, connect, shortAddress, address, loading: walletConnecting, error } = useWallet()
+export function Dashboard(
+  { onSelectQuest, onCreateQuest, onLaunchTutorial }: DashboardProps = {} as DashboardProps
+) {
+  const { connected, connect, shortAddress, address } = useWallet()
   const [filter, setFilter] = useState<"all" | "owned" | "enrolled">("all")
   const [preset, setPreset] = useState<
     "none" | "ending-soon" | "recently-funded" | "recently-verified"
   >("none")
   const [search, setSearch] = useState("")
   const [category, setCategory] = useState("all")
+  const [creatorFilter, setCreatorFilter] = useState("all")
+  const [rewardTokenFilter, setRewardTokenFilter] = useState("all")
   const [sortBy, setSortBy] = useState<
     "newest" | "ending-soon" | "most-enrolled" | "highest-reward"
   >("newest")
@@ -70,7 +76,12 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
   const [rewardMin, setRewardMin] = useState<string>("")
   const [rewardMax, setRewardMax] = useState<string>("")
   const [displayCount, setDisplayCount] = useState(DASHBOARD_QUEST_PAGE_SIZE)
-  const [nowSeconds] = useState(() => Math.floor(Date.now() / 1000))
+  // Live clock: deadline filters and derived lifecycle status must reflect the
+  // real time, not the value sampled on first render — a tab left open in the
+  // background used to keep showing quests as "ending soon" long after their
+  // deadline passed (issue #1335). A minute is enough granularity here and
+  // keeps the (potentially long) quest list from re-rendering more often.
+  const nowSeconds = useNowSeconds(60_000)
 
   // Incremental, contract-side pagination of the public quest feed so the
   // dashboard never renders all (potentially hundreds of) quests at once.
@@ -102,7 +113,7 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
       active = false
     }
   }, [category])
-  
+
   const onboarding = useOnboarding()
 
   // Dashboard data stays refetchable so error-state retry can reload the full view.
@@ -148,9 +159,7 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
         console.warn("[Dashboard] No preview quests loaded from any source")
       }
 
-      const previewQuestMap = new Map(
-        previewAllQuests.map(quest => [quest.id, quest] as const)
-      )
+      const previewQuestMap = new Map(previewAllQuests.map(quest => [quest.id, quest] as const))
 
       if (previewQuestMap.size < previewAllQuests.length) {
         console.warn(
@@ -243,6 +252,10 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
   }
 
   const goToCreateQuest = () => {
+    if (!connected) {
+      connect()
+      return
+    }
     if (onCreateQuest) {
       onCreateQuest()
       return
@@ -253,11 +266,7 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
   const loadedPublicQuests = [...publicQuests, ...extraPublicQuests]
 
   const filteredQuests =
-    filter === "owned"
-      ? ownedQuests
-      : filter === "enrolled"
-        ? enrolledQuests
-        : loadedPublicQuests
+    filter === "owned" ? ownedQuests : filter === "enrolled" ? enrolledQuests : loadedPublicQuests
 
   const presetFilteredQuests = (() => {
     if (preset === "ending-soon") {
@@ -279,17 +288,19 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
   const availableCategories = Array.from(
     new Set(filteredQuests.map(q => q.category).filter((c): c is string => !!c))
   ).sort()
+  const availableCreators = Array.from(new Set(filteredQuests.map(q => q.owner))).sort()
+  const availableRewardTokens = Array.from(new Set(filteredQuests.map(q => q.tokenAddr))).sort()
 
-  // Derive quest status from on-chain state
-  function deriveQuestStatus(q: {
-    status: number
-    deadline: number
-    archivedAt?: number
-  }): QuestDiscoveryStatus {
-    if (q.status === 1 || q.status === 2) return "completed" // Archived or Cancelled
-    if (q.deadline > 0 && q.deadline < nowSeconds) return "completed"
-    if (q.deadline > 0 && q.deadline > nowSeconds) return "upcoming"
-    return "active"
+  // Derive quest status from on-chain state via the single shared
+  // lifecycle-status function (see lib/utils.ts's getQuestLifecycleStatus doc
+  // comment) instead of reimplementing the active/expired/archived/cancelled
+  // logic locally with its own edge cases.
+  function deriveQuestStatus(q: { status: number; deadline: number }): QuestDiscoveryStatus {
+    const lifecycle = getQuestLifecycleStatus({
+      status: q.status as QuestInfo["status"],
+      deadline: q.deadline,
+    })
+    return lifecycle === "active" ? "active" : "completed"
   }
 
   const statusFilteredQuests =
@@ -302,10 +313,20 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
       ? statusFilteredQuests
       : statusFilteredQuests.filter(q => q.category === category)
 
+  const creatorFilteredQuests =
+    creatorFilter === "all"
+      ? categoryFilteredQuests
+      : categoryFilteredQuests.filter(q => q.owner === creatorFilter)
+
+  const tokenFilteredQuests =
+    rewardTokenFilter === "all"
+      ? creatorFilteredQuests
+      : creatorFilteredQuests.filter(q => q.tokenAddr === rewardTokenFilter)
+
   // Reward range filter
   const rewardMinNum = rewardMin !== "" ? Number(rewardMin) : 0
   const rewardMaxNum = rewardMax !== "" ? Number(rewardMax) : Infinity
-  const rewardFilteredQuests = categoryFilteredQuests.filter(q => {
+  const rewardFilteredQuests = tokenFilteredQuests.filter(q => {
     const stats = questStats[q.id]
     const pool = stats?.poolBalance ?? 0
     if (rewardMin !== "" && pool < rewardMinNum) return false
@@ -381,129 +402,43 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
     { date: currentMonth, amount: Number(userEarnings) },
   ]
 
-  if (!connected) {
-    return (
-      <div className="relative flex min-h-[calc(100vh-67px)] items-center justify-center overflow-hidden">
-        {/* Background elements */}
-        <div className="bg-grid-dots pointer-events-none absolute inset-0" />
-        <div
-          className="bg-accent border-border animate-float absolute top-[10%] left-[8%] h-20 w-20 rotate-12 border opacity-[0.08] shadow-md"
-          style={{ animationDuration: "8s" }}
-        />
-        <div
-          className="bg-accent border-border animate-float absolute right-[6%] bottom-[15%] h-14 w-14 -rotate-6 border opacity-[0.1] shadow-md"
-          style={{ animationDuration: "6s", animationDelay: "1s" }}
-        />
-        <div
-          className="bg-success border-border animate-float absolute top-[60%] left-[5%] h-10 w-10 rotate-45 border opacity-[0.06] shadow-sm"
-          style={{ animationDuration: "7s", animationDelay: "2s" }}
-        />
-        <div
-          className="bg-accent border-border animate-float absolute top-[20%] right-[12%] h-8 w-8 -rotate-12 border opacity-[0.07]"
-          style={{ animationDuration: "9s", animationDelay: "0.5s" }}
-        />
-
-        <div className="relative mx-auto max-w-lg px-4">
-          {/* Card container */}
-          <div className="bg-background border-border animate-scale-in overflow-hidden border shadow-xl">
-            {/* Yellow header strip */}
-            <div className="bg-accent border-border flex items-center justify-between border-b px-6 py-3">
-              <span className="text-xs font-semibold tracking-wider uppercase">Dashboard</span>
-              <div className="flex items-center gap-1.5">
-                <div className="bg-destructive border-border h-2.5 w-2.5 border" />
-                <span className="text-xs font-bold">Not Connected</span>
-              </div>
-            </div>
-
-            <div className="p-8 text-center sm:p-10">
-              <div className="bg-accent border-border animate-fade-in-up mx-auto mb-6 flex h-20 w-20 items-center justify-center border shadow-md">
-                <Wallet className="h-8 w-8" />
-              </div>
-              <h2 className="animate-fade-in-up stagger-1 mb-3 text-2xl font-semibold sm:text-3xl">
-                Connect your wallet
-              </h2>
-              <p className="text-muted-foreground animate-fade-in-up stagger-2 mx-auto mb-8 max-w-sm">
-                Connect your Freighter wallet to view your quests, track your progress, and start
-                earning USDC.
-              </p>
-              <Button
-                size="lg"
-                onClick={connect}
-                disabled={walletConnecting}
-                className="shimmer-on-hover animate-fade-in-up stagger-3"
-              >
-                {walletConnecting ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Connecting...
-                  </>
-                ) : (
-                  <>
-                    <Wallet className="h-4 w-4" />
-                    Connect Wallet
-                  </>
-                )}
-              </Button>
-
-              {error && (
-                <div
-                  role="alert"
-                  className="border-border bg-destructive/10 mb-6 border px-4 py-3 text-left text-sm font-semibold text-destructive"
-                >
-                  {error.message}
-                </div>
-              )}
-
-              {/* Mini feature list */}
-              <div className="border-border animate-fade-in-up stagger-4 mt-8 border-t pt-6">
-                <div className="flex flex-wrap justify-center gap-4">
-                  {[
-                    { icon: Target, text: "Track quests" },
-                    { icon: Coins, text: "Earn tokens" },
-                    { icon: Sparkles, text: "On-chain" },
-                  ].map(item => (
-                    <div key={item.text} className="flex items-center gap-2">
-                      <div className="bg-secondary border-border flex h-6 w-6 items-center justify-center border-[1.5px]">
-                        <item.icon className="h-3 w-3" />
-                      </div>
-                      <span className="text-muted-foreground text-xs font-bold">{item.text}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Decorative accent blocks */}
-          <div className="bg-accent border-border animate-fade-in-up stagger-5 absolute -top-4 -right-4 hidden h-10 w-10 rotate-12 border shadow-md sm:block" />
-          <div className="bg-success border-border animate-fade-in-up stagger-6 absolute -bottom-3 -left-3 hidden h-8 w-8 -rotate-6 border shadow-sm sm:block" />
-        </div>
-      </div>
-    )
-  }
-
   // We group all return elements into a single return with one parent div to avoid JSX parsing ambiguity
   return (
     <div className="relative mx-auto max-w-7xl px-4 py-8 sm:px-6">
       {/* Getting Started Banner for new users */}
       {!onboarding?.completed && (
-        <div className="bg-primary text-primary-foreground mb-8 flex flex-col sm:flex-row items-center justify-between p-6 shadow-lg">
+        <div className="bg-primary text-primary-foreground mb-8 flex flex-col items-center justify-between p-6 shadow-lg sm:flex-row">
           <div>
-            <h2 className="text-xl font-bold flex items-center gap-2">
+            <h2 className="flex items-center gap-2 text-xl font-bold">
               <Sparkles className="h-5 w-5" /> Let's get you started!
             </h2>
-            <p className="mt-1 text-primary-foreground/80">
+            <p className="text-primary-foreground/80 mt-1">
               New to Lernza? Take our quick interactive tour to learn how to earn or create quests.
             </p>
           </div>
-          <div className="mt-4 sm:mt-0 flex gap-3">
-            <Button variant="secondary" onClick={() => onboarding?.open?.(0)} className="font-bold">
+          <div className="mt-4 flex gap-3 sm:mt-0">
+            <Button
+              variant="secondary"
+              onClick={() => onboarding?.open?.(0)}
+              className="font-bold"
+              aria-label="Start learner tour"
+            >
               Learner Tour
             </Button>
-            <Button variant="outline" onClick={() => onboarding?.open?.(5)} className="bg-transparent border-primary-foreground hover:bg-primary-foreground/10 text-primary-foreground">
+            <Button
+              variant="outline"
+              onClick={() => onboarding?.open?.(5)}
+              className="border-primary-foreground hover:bg-primary-foreground/10 text-primary-foreground bg-transparent"
+              aria-label="Start creator tour"
+            >
               Creator Tour
             </Button>
-            <Button variant="ghost" onClick={() => onboarding?.complete?.()} className="hover:bg-primary-foreground/10 text-primary-foreground" aria-label="Dismiss banner">
+            <Button
+              variant="ghost"
+              onClick={() => onboarding?.complete?.()}
+              className="hover:bg-primary-foreground/10 text-primary-foreground"
+              aria-label="Dismiss banner"
+            >
               <X className="h-4 w-4" />
             </Button>
           </div>
@@ -517,15 +452,23 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
           <div>
             <div className="mb-2 flex items-center gap-2">
               <Sparkles className="h-5 w-5" />
-              <span className="text-sm font-bold tracking-wider uppercase">Welcome back</span>
+              <span className="text-sm font-bold tracking-wider uppercase">
+                {connected ? "Welcome back" : "Welcome to Lernza"}
+              </span>
             </div>
-            <PrefetchLink to={`/creator/${address}`}>
-              <h1 className="hover:text-background/80 text-3xl font-semibold transition-colors sm:text-4xl">
-                {shortAddress}
-              </h1>
-            </PrefetchLink>
+            {connected ? (
+              <PrefetchLink to={`/creator/${address}`}>
+                <h1 className="hover:text-background/80 text-3xl font-semibold transition-colors sm:text-4xl">
+                  {shortAddress}
+                </h1>
+              </PrefetchLink>
+            ) : (
+              <h1 className="text-3xl font-semibold sm:text-4xl">Discover Quests</h1>
+            )}
             <p className="mt-1 text-sm font-bold opacity-70">
-              You have {personalStats.questsEnrolled} active quests
+              {connected
+                ? `You have ${personalStats.questsEnrolled} active quests`
+                : "Explore on-chain educational paths"}
             </p>
           </div>
           <Button
@@ -542,7 +485,7 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
               variant="outline"
               onClick={onLaunchTutorial}
               data-onboarding="tutorial-button"
-              className="flex-shrink-0 flex items-center gap-2"
+              className="flex flex-shrink-0 items-center gap-2"
               aria-label="Open getting started tutorial"
             >
               <BookOpen className="h-4 w-4" aria-hidden="true" />
@@ -558,46 +501,53 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
         {/* Left Column (Personal Stats, Chart, Quests) */}
         <div className="animate-fade-in-up stagger-2 space-y-8 lg:col-span-2">
           {/* Personal Stats */}
-          <SectionErrorBoundary label="Personal stats">
-            <PersonalProgress stats={personalStats} />
-          </SectionErrorBoundary>
+          {connected && (
+            <>
+              <SectionErrorBoundary label="Personal stats">
+                <PersonalProgress stats={personalStats} />
+              </SectionErrorBoundary>
 
-          {/* Earnings Chart (Lazy Loaded) */}
-          <SectionErrorBoundary label="Earnings chart">
-            <Suspense
-              fallback={
-                <div className="bg-muted border-border h-[250px] animate-pulse border shadow-lg" />
-              }
-            >
-              <EarningsChart data={earningsHistory} />
-            </Suspense>
-          </SectionErrorBoundary>
+              {/* Earnings Chart (Lazy Loaded) */}
+              <SectionErrorBoundary label="Earnings chart">
+                <Suspense
+                  fallback={
+                    <div className="bg-muted border-border h-[250px] animate-pulse border shadow-lg" />
+                  }
+                >
+                  <EarningsChart data={earningsHistory} />
+                </Suspense>
+              </SectionErrorBoundary>
+            </>
+          )}
 
           {/* Your Quests Section */}
           <SectionErrorBoundary label="Your quests">
             <div>
               <div className="relative mb-5 flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
                 <h2 className="flex items-center gap-2 text-xl font-semibold">
-                  <LayoutDashboard className="h-5 w-5" /> Your Quests
+                  <LayoutDashboard className="h-5 w-5" />{" "}
+                  {connected ? "Your Quests" : "Public Quests"}
                 </h2>
-                <div
-                  className="border-border flex gap-0 border shadow-md"
-                  role="group"
-                  aria-label="Quest filter"
-                >
-                  {(["all", "owned", "enrolled"] as const).map(f => (
-                    <button
-                      key={f}
-                      onClick={() => setFilter(f)}
-                      aria-pressed={filter === f}
-                      className={`border-border cursor-pointer border-r px-4 py-2 text-xs font-semibold tracking-wider capitalize uppercase transition-colors last:border-r-0 ${
-                        filter === f ? "bg-accent" : "bg-background hover:bg-secondary"
-                      }`}
-                    >
-                      {f === "all" ? "Show all" : f === "owned" ? "Show owned" : "Show enrolled"}
-                    </button>
-                  ))}
-                </div>
+                {connected && (
+                  <div
+                    className="border-border flex gap-0 border shadow-md"
+                    role="group"
+                    aria-label="Quest filter"
+                  >
+                    {(["all", "owned", "enrolled"] as const).map(f => (
+                      <button
+                        key={f}
+                        onClick={() => setFilter(f)}
+                        aria-pressed={filter === f}
+                        className={`border-border cursor-pointer border-r px-4 py-2 text-xs font-semibold tracking-wider capitalize uppercase transition-colors last:border-r-0 ${
+                          filter === f ? "bg-accent" : "bg-background hover:bg-secondary"
+                        }`}
+                      >
+                        {f === "all" ? "Show all" : f === "owned" ? "Show owned" : "Show enrolled"}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {/* Search, category filter, and sort */}
@@ -639,6 +589,36 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
                 </select>
 
                 <select
+                  value={creatorFilter}
+                  onChange={e => setCreatorFilter(e.target.value)}
+                  aria-label="Filter by creator"
+                  className="border-border bg-background cursor-pointer border px-3 py-2.5 text-xs font-semibold tracking-wider uppercase shadow-sm focus:outline-none"
+                >
+                  <option value="all">All creators</option>
+                  {availableCreators.map(creator => (
+                    <option key={creator} value={creator}>
+                      {creator === address
+                        ? "You"
+                        : `${creator.slice(0, 6)}...${creator.slice(-4)}`}
+                    </option>
+                  ))}
+                </select>
+
+                <select
+                  value={rewardTokenFilter}
+                  onChange={e => setRewardTokenFilter(e.target.value)}
+                  aria-label="Filter by reward token"
+                  className="border-border bg-background cursor-pointer border px-3 py-2.5 text-xs font-semibold tracking-wider uppercase shadow-sm focus:outline-none"
+                >
+                  <option value="all">All tokens</option>
+                  {availableRewardTokens.map(token => (
+                    <option key={token} value={token}>
+                      {`${token.slice(0, 6)}...${token.slice(-4)}`}
+                    </option>
+                  ))}
+                </select>
+
+                <select
                   value={sortBy}
                   onChange={e => setSortBy(e.target.value as typeof sortBy)}
                   aria-label="Sort quests"
@@ -672,7 +652,6 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
                   [
                     { value: "all", label: "All status" },
                     { value: "active", label: "Active" },
-                    { value: "upcoming", label: "Upcoming" },
                     { value: "completed", label: "Completed" },
                   ] as const
                 ).map(s => (
@@ -695,7 +674,9 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
               <div className="mb-5 flex flex-wrap items-center gap-3">
                 <div className="flex items-center gap-1.5">
                   <SlidersHorizontal className="text-muted-foreground h-3.5 w-3.5" />
-                  <span className="text-muted-foreground text-xs font-bold uppercase">Reward range:</span>
+                  <span className="text-muted-foreground text-xs font-bold uppercase">
+                    Reward range:
+                  </span>
                 </div>
                 <div className="flex items-center gap-2">
                   <input
@@ -720,7 +701,10 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
                   {(rewardMin !== "" || rewardMax !== "") && (
                     <button
                       type="button"
-                      onClick={() => { setRewardMin(""); setRewardMax("") }}
+                      onClick={() => {
+                        setRewardMin("")
+                        setRewardMax("")
+                      }}
                       aria-label="Clear reward range"
                       className="text-muted-foreground hover:text-foreground"
                     >
@@ -771,10 +755,18 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
                     poolBalance: 0,
                   }
                   const totalMilestones = stats.milestoneCount
-                  const completedCount = questCompletions[ws.id] || 0
+                  // Treat missing/null completion as unknown — never coerce to 0% which
+                  // looks like "started but empty". See #1331.
+                  const completedCount = questCompletions[ws.id]
+                  const hasCompletion =
+                    typeof completedCount === "number" && Number.isFinite(completedCount)
+                  const startedCount = hasCompletion ? completedCount : 0
+                  const notStarted = !hasCompletion || startedCount === 0
                   const totalReward = stats.poolBalance
                   const earnedReward =
-                    totalMilestones > 0 ? (totalReward * completedCount) / totalMilestones : 0
+                    totalMilestones > 0 && hasCompletion
+                      ? (totalReward * startedCount) / totalMilestones
+                      : 0
                   const isOwned = !!address && ws.owner === address
 
                   return (
@@ -782,6 +774,8 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
                       key={ws.id}
                       type="button"
                       onClick={() => goToQuest(ws.id)}
+                      onMouseEnter={() => void prefetchQuestData(queryClient, ws.id)}
+                      onFocus={() => void prefetchQuestData(queryClient, ws.id)}
                       aria-label={`Open quest ${ws.name}`}
                       data-onboarding={i === 0 ? "quest-card" : undefined}
                       className={`card-tilt group animate-fade-in-up cursor-pointer stagger-${i + 1} focus-visible:ring-ring w-full text-left focus-visible:ring-2 focus-visible:outline-none`}
@@ -794,7 +788,9 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
                                 <CardTitle className="group-hover:text-accent text-base transition-colors">
                                   {ws.name}
                                 </CardTitle>
-                                {completedCount === totalMilestones && totalMilestones > 0 && (
+                                {hasCompletion &&
+                                  startedCount === totalMilestones &&
+                                  totalMilestones > 0 && (
                                   <Badge variant="success" className="gap-1">
                                     <Sparkles className="h-3 w-3" />
                                     Complete
@@ -846,16 +842,25 @@ export function Dashboard({ onSelectQuest, onCreateQuest, onLaunchTutorial }: Da
 
                           {totalMilestones > 0 && (
                             <div className="space-y-2">
-                              <div className="flex items-center gap-3">
-                                <Progress
-                                  value={completedCount}
-                                  max={totalMilestones}
-                                  className="flex-1"
-                                />
-                                <span className="text-muted-foreground text-xs font-bold whitespace-nowrap">
-                                  {completedCount}/{totalMilestones}
-                                </span>
-                              </div>
+                              {notStarted ? (
+                                <p
+                                  className="text-muted-foreground text-xs font-bold"
+                                  data-testid="quest-progress-not-started"
+                                >
+                                  Not started
+                                </p>
+                              ) : (
+                                <div className="flex items-center gap-3">
+                                  <Progress
+                                    value={startedCount}
+                                    max={totalMilestones}
+                                    className="flex-1"
+                                  />
+                                  <span className="text-muted-foreground text-xs font-bold whitespace-nowrap">
+                                    {startedCount}/{totalMilestones}
+                                  </span>
+                                </div>
+                              )}
                               {earnedReward > 0 && (
                                 <div className="flex items-center justify-between">
                                   <span className="text-muted-foreground text-xs font-bold">

@@ -19,6 +19,8 @@ export const MAX_REWARD_AMOUNT = 1_000_000_000
 export const Visibility = {
   Public: 0,
   Private: 1,
+  Unlisted: 2,
+  InviteOnly: 3,
 } as const
 export type Visibility = (typeof Visibility)[keyof typeof Visibility]
 
@@ -57,6 +59,7 @@ export interface QuestInfo {
   deadline: number // u64
   maxEnrollees?: number // Option<u32> (max_enrollees in Rust)
   verified: boolean // bool
+  metadataUri?: string // Option<String> (metadata_uri in Rust)
 }
 
 /**

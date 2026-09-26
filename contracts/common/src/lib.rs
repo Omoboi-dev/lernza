@@ -6,6 +6,8 @@ use soroban_sdk::{contracttype, Address, Env, String, Vec};
 /// preventing accidental misuse with invalid types at compile time.
 pub trait IsDataKey: soroban_sdk::IntoVal<Env, soroban_sdk::Val> {}
 
+impl IsDataKey for String {}
+
 /// Target TTL for persistent and instance storage entries: 518_400 ledgers.
 /// At ~5 seconds per ledger this is roughly 30 days. Every write or meaningful
 /// update to a long-lived entry should extend its TTL to this value so that
@@ -66,6 +68,8 @@ pub fn error_info(code: u32) -> &'static str {
 pub enum Visibility {
     Public = 0,
     Private = 1,
+    Unlisted = 2,
+    InviteOnly = 3,
 }
 
 #[contracttype]
@@ -75,6 +79,7 @@ pub enum QuestStatus {
     Active = 0,
     Archived = 1,
     Cancelled = 2,
+    Suspended = 3,
 }
 
 #[contracttype]
@@ -103,9 +108,15 @@ pub struct QuestInfo {
     pub deadline: u64,
     pub archived_at: u64,
     pub max_enrollees: Option<u32>,
+    /// Optional re-enrollment cooldown in ledger sequences. When set, an
+    /// address that leaves a quest cannot re-enroll until this many ledgers
+    /// have passed since it was removed (#1649). `None` preserves the
+    /// previous behaviour of unrestricted re-enrollment.
+    pub cooldown_period: Option<u32>,
     pub verified: bool,
     pub version: u32,
     pub prerequisite_quest_ids: Vec<u32>,
+    pub metadata_uri: Option<String>,
 }
 
 #[contracttype]
@@ -128,6 +139,7 @@ pub struct QuestVersion {
     pub visibility: Visibility,
     pub max_enrollees: Option<u32>,
     pub updated_at: u64,
+    pub metadata_uri: Option<String>,
 }
 
 /// Validate that an address is a Stellar contract address (not an account).
@@ -171,8 +183,7 @@ pub fn is_contract_address(addr: &Address) -> bool {
         return false;
     }
 
-    for i in 1..56 {
-        let c = buf[i];
+    for &c in buf[1..].iter() {
         let valid = c.is_ascii_uppercase() || (b'2'..=b'7').contains(&c);
         if !valid {
             return false;
@@ -194,7 +205,7 @@ pub fn extend_persistent_ttl(env: &Env, key: &impl IsDataKey) {
 /// Lightweight acceptance of http/https/ipfs schemes and rejects whitespace
 /// and empty strings.
 pub fn is_valid_url(s: &String) -> bool {
-    if s.len() == 0 || s.len() > 2048 {
+    if s.is_empty() || s.len() > 2048 {
         return false;
     }
     let mut buf = [0u8; 2048];
@@ -228,11 +239,11 @@ pub fn is_valid_url(s: &String) -> bool {
 /// Data: (caller_contract, target_contract, method_symbol, params)
 pub fn log_cross_call(env: &Env, target: &Address, method: &str, params: &String) {
     env.events().publish(
-        (soroban_sdk::Symbol::new(&env, "cross_contract_call"),),
+        (soroban_sdk::Symbol::new(env, "cross_contract_call"),),
         (
             env.current_contract_address(),
             target.clone(),
-            soroban_sdk::Symbol::new(&env, method),
+            soroban_sdk::Symbol::new(env, method),
             params.clone(),
         ),
     );
@@ -243,11 +254,11 @@ pub fn log_cross_call(env: &Env, target: &Address, method: &str, params: &String
 /// Data: (caller_contract, target_contract, method_symbol, success, result)
 pub fn log_cross_return(env: &Env, target: &Address, method: &str, success: bool, result: &String) {
     env.events().publish(
-        (soroban_sdk::Symbol::new(&env, "cross_contract_return"),),
+        (soroban_sdk::Symbol::new(env, "cross_contract_return"),),
         (
             env.current_contract_address(),
             target.clone(),
-            soroban_sdk::Symbol::new(&env, method),
+            soroban_sdk::Symbol::new(env, method),
             success,
             result.clone(),
         ),
@@ -256,11 +267,17 @@ pub fn log_cross_return(env: &Env, target: &Address, method: &str, success: bool
 
 /// Helper: emit a canonical quest_created event
 /// Topics: (quest_created,)
-/// Data: (quest_id, owner, name)
-pub fn emit_quest_created(env: &Env, quest_id: u32, owner: &Address, name: &String) {
+/// Data: (quest_id, owner, name, created_at)
+pub fn emit_quest_created(
+    env: &Env,
+    quest_id: u32,
+    owner: &Address,
+    name: &String,
+    created_at: u64,
+) {
     env.events().publish(
-        (soroban_sdk::Symbol::new(&env, "quest_created"),),
-        (quest_id, owner.clone(), name.clone()),
+        (soroban_sdk::Symbol::new(env, "quest_created"),),
+        (quest_id, owner.clone(), name.clone(), created_at),
     );
 }
 
@@ -269,7 +286,7 @@ pub fn emit_quest_created(env: &Env, quest_id: u32, owner: &Address, name: &Stri
 /// Data: (quest_id, funder, amount)
 pub fn emit_reward_funded(env: &Env, quest_id: u32, funder: &Address, amount: i128) {
     env.events().publish(
-        (soroban_sdk::Symbol::new(&env, "reward_funded"),),
+        (soroban_sdk::Symbol::new(env, "reward_funded"),),
         (quest_id, funder.clone(), amount),
     );
 }
@@ -285,7 +302,7 @@ pub fn emit_reward_distributed(
     amount: i128,
 ) {
     env.events().publish(
-        (soroban_sdk::Symbol::new(&env, "reward_distributed"),),
+        (soroban_sdk::Symbol::new(env, "reward_distributed"),),
         (quest_id, milestone_id, enrollee.clone(), amount),
     );
 }
@@ -329,3 +346,24 @@ pub fn estimate_persistent_rent(entry_size_bytes: u32) -> i128 {
     ((bytes * RENT_STROOPS_PER_KB_PER_BUMP) + 1023) / 1024
 }
 
+/// Deterministic milestone ID — issue #1340
+/// Uses hash(quest_id || timestamp || nonce) to avoid collisions on redeploy/fork
+pub fn deterministic_milestone_id(quest_id: &[u8], timestamp: u64, nonce: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let ts_bytes = timestamp.to_be_bytes();
+    let nonce_bytes = nonce.to_be_bytes();
+    let mut idx = 0;
+    for &b in quest_id {
+        out[idx % 32] ^= b;
+        idx += 1;
+    }
+    for &b in &ts_bytes {
+        out[idx % 32] ^= b;
+        idx += 1;
+    }
+    for &b in &nonce_bytes {
+        out[idx % 32] ^= b;
+        idx += 1;
+    }
+    out
+}

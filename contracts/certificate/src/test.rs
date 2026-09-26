@@ -29,6 +29,8 @@ fn test_certificate_minting() {
     assert_eq!(metadata.quest_category, quest_category);
     assert_eq!(metadata.recipient, recipient);
     assert_eq!(metadata.issuer, owner);
+    // No milestone contract wired up yet -> milestone_count falls back to 0.
+    assert_eq!(metadata.milestone_count, 0);
 
     let user_certs = client.get_user_certificates(&recipient);
     assert_eq!(user_certs.len(), 1);
@@ -179,7 +181,10 @@ fn test_set_metadata_base_rejects_whitespace() {
 fn test_set_metadata_base_accepts_ipfs_uri() {
     // Issue #1273 — ipfs:// URIs remain a valid metadata base scheme.
     let (env, client, _owner) = setup();
-    let uri = String::from_str(&env, "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi/");
+    let uri = String::from_str(
+        &env,
+        "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi/",
+    );
     client.set_metadata_base(&uri);
     assert_eq!(client.get_metadata_base(), uri);
 }

@@ -8,6 +8,7 @@ import {
   useRef,
 } from "react"
 import type { Step1Values, Step2Values, FormStep } from "./types"
+import type { QuestTemplate } from "./templates"
 
 export const DRAFT_STORAGE_KEY = "lernza_quest_draft_v1"
 
@@ -36,6 +37,8 @@ export interface QuestCreationContextType {
   dismissDraft: () => void
   clearDraft: () => void
   saveDraft: () => void
+  applyTemplate: (template: QuestTemplate) => void
+  loadDraft: (step1: Step1Values, step2: Step2Values, currentStep: FormStep) => void
 }
 
 const QuestCreationContext = createContext<QuestCreationContextType | undefined>(undefined)
@@ -54,6 +57,16 @@ const DEFAULT_STEP2: Step2Values = {
 export function QuestCreationProvider({ children }: { children: ReactNode }) {
   const [step1Data, setStep1Data] = useState<Step1Values>(DEFAULT_STEP1)
   const [step2Data, setStep2Data] = useState<Step2Values>(DEFAULT_STEP2)
+  const [step1Data, setStep1Data] = useState<Step1Values>({
+    name: "",
+    description: "",
+    category: "",
+    tags: [],
+    referralBonus: 10,
+  })
+  const [step2Data, setStep2Data] = useState<Step2Values>({
+    milestones: [{ title: "", description: "", rewardAmount: 0, prerequisiteIds: [] }],
+  })
   const [currentStep, setCurrentStep] = useState<FormStep>(1)
 
   const [lastSaved, setLastSaved] = useState<Date | null>(null)
@@ -188,6 +201,19 @@ export function QuestCreationProvider({ children }: { children: ReactNode }) {
     setCurrentStep((prev) => (prev - 1) as FormStep)
     window.scrollTo({ top: 0, behavior: "smooth" })
   }, [])
+  const loadDraft = useCallback((step1: Step1Values, step2: Step2Values, step: FormStep) => {
+    setStep1Data(step1)
+    setStep2Data(step2)
+    setCurrentStep(step)
+  }, [])
+
+  const applyTemplate = useCallback((template: QuestTemplate) => {
+    setStep1Data({ ...template.step1, tags: [...template.step1.tags] })
+    setStep2Data({
+      milestones: template.step2.milestones.map(milestone => ({ ...milestone })),
+    })
+    setCurrentStep(1)
+  }, [])
 
   const value = {
     step1Data,
@@ -206,6 +232,8 @@ export function QuestCreationProvider({ children }: { children: ReactNode }) {
     dismissDraft,
     clearDraft,
     saveDraft,
+    applyTemplate,
+    loadDraft,
   }
 
   return <QuestCreationContext.Provider value={value}>{children}</QuestCreationContext.Provider>

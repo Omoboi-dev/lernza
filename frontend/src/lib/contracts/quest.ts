@@ -1,28 +1,14 @@
 /** Soroban contract client for Lernza quests (create, enroll, complete, verify). */
-import { isDev, env } from "@/lib/env"
-import {
-  Address,
-  Contract,
-  nativeToScVal,
-  scValToNative,
-  TransactionBuilder,
-  Keypair,
-  Account,
-} from "@stellar/stellar-sdk"
+import { isDev } from "@/lib/env"
+import { Address, Contract, nativeToScVal } from "@stellar/stellar-sdk"
 import type { xdr } from "@stellar/stellar-sdk"
 import type { TransactionLifecycleHandlers, TransactionResult } from "./client"
-import {
-  server,
-  signAndSubmit,
-  NETWORK_PASSPHRASE,
-  RPC_TIMEOUT_MS,
-  withTimeout,
-  withRpcReadThrottle,
-} from "./client"
+import { signAndSubmitTracked, simulateContractRead, prepareContractTransaction } from "./client"
 import { safeContractCall } from "../error-utils"
 import { withContractLogging } from "./logger"
+import { contractAddresses } from "./config"
 
-const CONTRACT_ID = env.VITE_QUEST_CONTRACT_ID
+const CONTRACT_ID = contractAddresses.quest
 
 // Re-export so consumers can import the canonical contract types from either
 // `@/lib/contracts/quest` or `@/lib/contract-types`. Keeping both import paths
@@ -180,7 +166,7 @@ export class QuestClient {
         new Address(admin).toScVal(),
         new Address(creator).toScVal(),
       ])
-      return signAndSubmit(tx)
+      return signAndSubmitTracked(tx, "Verify Creator")
     })
   }
 
@@ -197,7 +183,8 @@ export class QuestClient {
     tags: string[],
     tokenAddr: string,
     visibility: Visibility,
-    maxEnrollees?: number
+    maxEnrollees?: number,
+    deadline?: number
   ) {
     return safeContractCall(async () => {
       const tx = await this.buildTx(owner, "create_quest", [
@@ -211,8 +198,9 @@ export class QuestClient {
         maxEnrollees !== undefined
           ? nativeToScVal(maxEnrollees, { type: "u32" })
           : nativeToScVal(null),
+        deadline !== undefined ? nativeToScVal(deadline, { type: "u64" }) : nativeToScVal(null),
       ])
-      return signAndSubmit(tx)
+      return signAndSubmitTracked(tx, "Create Quest")
     })
   }
 
@@ -244,7 +232,7 @@ export class QuestClient {
           ? nativeToScVal(maxEnrollees, { type: "u32" })
           : nativeToScVal(null),
       ])
-      return signAndSubmit(tx)
+      return signAndSubmitTracked(tx, "Update Quest")
     })
   }
 
@@ -259,7 +247,7 @@ export class QuestClient {
       const tx = await this.buildTx(owner, "archive_quest", [
         nativeToScVal(questId, { type: "u32" }),
       ])
-      return signAndSubmit(tx, handlers)
+      return signAndSubmitTracked(tx, "Archive Quest", handlers)
     })
   }
 
@@ -307,7 +295,7 @@ export class QuestClient {
         nativeToScVal(questId, { type: "u32" }),
         new Address(enrollee).toScVal(),
       ])
-      return signAndSubmit(tx, handlers)
+      return signAndSubmitTracked(tx, "Add Enrollee", handlers)
     })
   }
 
@@ -325,7 +313,7 @@ export class QuestClient {
         nativeToScVal(questId, { type: "u32" }),
         new Address(enrollee).toScVal(),
       ])
-      return signAndSubmit(tx, handlers)
+      return signAndSubmitTracked(tx, "Remove Enrollee", handlers)
     })
   }
 
@@ -339,7 +327,7 @@ export class QuestClient {
         new Address(enrollee).toScVal(),
         nativeToScVal(questId, { type: "u32" }),
       ])
-      return signAndSubmit(tx, handlers)
+      return signAndSubmitTracked(tx, "Leave Quest", handlers)
     })
   }
 
@@ -352,7 +340,7 @@ export class QuestClient {
         new Address(enrollee).toScVal(),
         nativeToScVal(questId, { type: "u32" }),
       ])
-      return signAndSubmit(tx, handlers)
+      return signAndSubmitTracked(tx, "Join Quest", handlers)
     })
   }
 
@@ -365,7 +353,7 @@ export class QuestClient {
         nativeToScVal(questId, { type: "u32" }),
         nativeToScVal(visibility, { type: "u32" }),
       ])
-      return signAndSubmit(tx)
+      return signAndSubmitTracked(tx, "Update Visibility")
     })
   }
 
@@ -379,7 +367,45 @@ export class QuestClient {
         nativeToScVal(questId, { type: "u32" }),
         nativeToScVal(deadline, { type: "u64" }),
       ])
-      return signAndSubmit(tx)
+      return signAndSubmitTracked(tx, "Update Deadline")
+    })
+  }
+
+  async isInviteValid(questId: number, commitment: string): Promise<boolean> {
+    const result = await this.invokeRead("is_invite_valid", [
+      nativeToScVal(questId, { type: "u32" }),
+      nativeToScVal(commitment, { type: "string" }),
+    ])
+    return !!result
+  }
+
+  async registerInvite(owner: string, questId: number, commitment: string) {
+    return safeContractCall(async () => {
+      const tx = await this.buildTx(owner, "register_invite", [
+        nativeToScVal(questId, { type: "u32" }),
+        nativeToScVal(commitment, { type: "string" }),
+      ])
+      return signAndSubmitTracked(tx, "Register Invite")
+    })
+  }
+
+  async revokeInvite(owner: string, questId: number, commitment: string) {
+    return safeContractCall(async () => {
+      const tx = await this.buildTx(owner, "revoke_invite", [
+        nativeToScVal(questId, { type: "u32" }),
+        nativeToScVal(commitment, { type: "string" }),
+      ])
+      return signAndSubmitTracked(tx, "Revoke Invite")
+    })
+  }
+
+  async joinQuestWithInvite(learner: string, questId: number, code: string) {
+    return safeContractCall(async () => {
+      const tx = await this.buildTx(learner, "join_with_invite", [
+        nativeToScVal(questId, { type: "u32" }),
+        nativeToScVal(code, { type: "string" }),
+      ])
+      return signAndSubmitTracked(tx, "Join Quest With Invite")
     })
   }
 
@@ -401,30 +427,24 @@ export class QuestClient {
       deadline: Number(r.deadline),
       maxEnrollees: r.max_enrollees ? Number(r.max_enrollees) : undefined,
       verified: !!r.verified,
+      metadataUri: r.metadata_uri ? String(r.metadata_uri) : undefined,
     }
+  }
+
+  async setMetadataUri(owner: string, questId: number, metadataUri?: string) {
+    return safeContractCall(async () => {
+      const tx = await this.buildTx(owner, "set_metadata_uri", [
+        nativeToScVal(questId, { type: "u32" }),
+        new Address(owner).toScVal(),
+        metadataUri ? nativeToScVal(metadataUri, { type: "string" }) : nativeToScVal(null),
+      ])
+      return signAndSubmitTracked(tx, "Set Quest Metadata URI")
+    })
   }
 
   private async invokeRead(method: string, args: xdr.ScVal[]) {
     return withContractLogging("quest", method, {}, async () => {
-      const randomKP = Keypair.random()
-      const account = new Account(randomKP.publicKey(), "0")
-
-      const tx = new TransactionBuilder(account, {
-        fee: "10000",
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(this.getContract().call(method, ...args))
-        .setTimeout(30)
-        .build()
-
-      const response = await withRpcReadThrottle(`loading ${method.replace(/_/g, " ")}`, () =>
-        withTimeout(server.simulateTransaction(tx), RPC_TIMEOUT_MS, `RPC timeout: ${method}`)
-      )
-
-      if (response && "result" in response && response.result) {
-        return scValToNative(response.result.retval)
-      }
-      return null
+      return simulateContractRead(this.getContract(), { method, args })
     }).catch((e: unknown) => {
       if (isDev) {
         console.error(`Read error ${method}:`, e)
@@ -434,25 +454,7 @@ export class QuestClient {
   }
 
   private async buildTx(source: string, method: string, args: xdr.ScVal[]) {
-    const account = await withTimeout(
-      server.getAccount(source),
-      RPC_TIMEOUT_MS,
-      "RPC timeout: getAccount"
-    )
-
-    const tx = new TransactionBuilder(account, {
-      fee: "10000",
-      networkPassphrase: NETWORK_PASSPHRASE,
-    })
-      .addOperation(this.getContract().call(method, ...args))
-      .setTimeout(30)
-      .build()
-
-    return await withTimeout(
-      server.prepareTransaction(tx),
-      RPC_TIMEOUT_MS,
-      "RPC timeout: prepareTransaction"
-    )
+    return prepareContractTransaction(this.getContract(), source, { method, args })
   }
 }
 

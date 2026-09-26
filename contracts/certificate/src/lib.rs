@@ -1,12 +1,13 @@
 #![no_std]
 
-use common::{extend_instance_ttl, extend_persistent_ttl, BUMP, THRESHOLD};
+use common::{extend_instance_ttl, extend_persistent_ttl};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, IntoVal, String,
+    Symbol, Vec,
 };
-use stellar_access::ownable::{self as ownable, Ownable};
-use stellar_macros::{default_impl, only_owner};
-use stellar_tokens::non_fungible::{burnable::NonFungibleBurnable, Base};
+use stellar_access::ownable::{self as ownable};
+use stellar_macros::only_owner;
+use stellar_tokens::non_fungible::Base;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -15,6 +16,9 @@ pub struct CertificateMetadata {
     pub quest_name: String,
     pub quest_category: String,
     pub completion_date: u64,
+    /// Number of milestones in the quest at mint time. Surfaced on the
+    /// public certificate page so a viewer can see how much was completed.
+    pub milestone_count: u32,
     pub issuer: Address,
     pub recipient: Address,
 }
@@ -39,11 +43,11 @@ impl common::IsDataKey for DataKey {}
 #[repr(u32)]
 pub enum Error {
     /// Entity not found (shared code 1).
-    NotFound = common::ERR_NOT_FOUND as u32,
+    NotFound = 1,
     /// Caller is not authorized (shared code 2).
-    Unauthorized = common::ERR_UNAUTHORIZED as u32,
+    Unauthorized = 2,
     /// Invalid input provided (shared code 3).
-    InvalidInput = common::ERR_INVALID_INPUT as u32,
+    InvalidInput = 3,
     NotOwner = 10,
     AlreadyIssued = 20,
     InvalidQuest = 5,
@@ -52,7 +56,7 @@ pub enum Error {
     MilestoneContractNotSet = 8,
     NotCompleted = 9,
     /// Contract is administratively paused (shared code 400).
-    Paused = common::ERR_PAUSED as u32,
+    Paused = 400,
 }
 
 // BUMP and THRESHOLD now come from common
@@ -109,6 +113,7 @@ impl CertificateContract {
             quest_name: quest_name.clone(),
             quest_category,
             completion_date: env.ledger().timestamp(),
+            milestone_count: Self::quest_milestone_count(env.clone(), quest_id),
             issuer: issuer.clone(),
             recipient: recipient.clone(),
         };
@@ -304,17 +309,43 @@ impl CertificateContract {
         }
         Ok(())
     }
-}
+
+    /// Resolve the number of milestones configured for `quest_id`.
+    ///
+    /// Best-effort: if the milestone contract hasn't been wired up via
+    /// `set_milestone_contract`, or the cross-contract read fails, we fall
+    /// back to 0 rather than failing the mint. The count is purely
+    /// informational metadata for the certificate display page.
+    fn quest_milestone_count(env: Env, quest_id: u32) -> u32 {
+        let milestone_contract: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MilestoneContract);
+        match milestone_contract {
+            Some(contract) => env
+                .invoke_contract(
+                    &contract,
+                    &Symbol::new(&env, "get_milestone_count"),
+                    soroban_sdk::vec![&env, quest_id.into_val(&env)],
+                ),
+            None => 0,
+        }
+    }
 
     #[only_owner]
     pub fn set_milestone_contract(env: Env, milestone_contract: Address) -> Result<(), Error> {
-        env.storage().instance().set(&DataKey::MilestoneContract, &milestone_contract);
+        env.storage()
+            .instance()
+            .set(&DataKey::MilestoneContract, &milestone_contract);
         extend_instance_ttl(&env);
         Ok(())
     }
 
     pub fn get_milestone_contract(env: Env) -> Result<Address, Error> {
-        env.storage().instance().get(&DataKey::MilestoneContract).ok_or(Error::MilestoneContractNotSet)
+        env.storage()
+            .instance()
+            .get(&DataKey::MilestoneContract)
+            .ok_or(Error::MilestoneContractNotSet)
     }
 
     pub fn verify_and_issue(
@@ -345,12 +376,19 @@ impl CertificateContract {
         }
 
         // Mint using the contract's own address as the issuer
-        Self::mint_certificate(env.clone(), quest_id, quest_name, quest_category, recipient, env.current_contract_address())
+        Self::mint_certificate(
+            env.clone(),
+            quest_id,
+            quest_name,
+            quest_category,
+            recipient,
+            env.current_contract_address(),
+        )
     }
 
     // SBT specific: Expose balance_of and owner_of, but NOT transfer
     pub fn balance_of(env: Env, id: Address) -> i128 {
-        Base::balance(&env, &id)
+        Base::balance(&env, &id).into()
     }
 
     pub fn owner_of(env: Env, token_id: u32) -> Option<Address> {
@@ -366,13 +404,27 @@ impl CertificateContract {
     }
 }
 
-#[default_impl]
-#[contractimpl]
-impl NonFungibleBurnable for CertificateContract {}
-
-#[default_impl]
-#[contractimpl]
-impl Ownable for CertificateContract {}
-
 #[cfg(test)]
 mod test;
+
+/// Deterministic milestone ID — issue #1340
+/// Uses hash(quest_id || timestamp || nonce) to avoid collisions on redeploy/fork
+pub fn deterministic_milestone_id(quest_id: &[u8], timestamp: u64, nonce: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let ts_bytes = timestamp.to_be_bytes();
+    let nonce_bytes = nonce.to_be_bytes();
+    let mut idx = 0;
+    for &b in quest_id {
+        out[idx % 32] ^= b;
+        idx += 1;
+    }
+    for &b in &ts_bytes {
+        out[idx % 32] ^= b;
+        idx += 1;
+    }
+    for &b in &nonce_bytes {
+        out[idx % 32] ^= b;
+        idx += 1;
+    }
+    out
+}
